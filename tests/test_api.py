@@ -1735,3 +1735,385 @@ def test_old_database_migrates_and_backfills_from_created_at(tmp_path):
             os.environ.pop("IMAGE_DB_PATH", None)
         else:
             os.environ["IMAGE_DB_PATH"] = old_env
+
+
+# --------------------------------------------------------------------------- #
+# Installation receipts & audit
+# --------------------------------------------------------------------------- #
+
+
+def make_named_channel(client, monkeypatch, name, percent=100):
+    """Create a channel over two freshly trusted images; return their ids."""
+    stable, candidate = make_channel_images(client, monkeypatch)
+    r = client.put(f"/channels/{name}", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": percent, "expected_revision": 0,
+    })
+    assert r.status_code == 200, r.text
+    return stable, candidate
+
+
+def post_receipt(client, name, device_id, seq, status="success",
+                 installed_id=None, revision=1):
+    payload = {"device_id": device_id, "revision": revision, "seq": seq,
+               "status": status}
+    if installed_id is not None:
+        payload["installed_id"] = installed_id
+    return client.post(f"/channels/{name}/receipts", json=payload)
+
+
+def audit(client, name):
+    r = client.get(f"/channels/{name}/installation-audit")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _receipt_rows(name):
+    """All stored receipt rows of a channel, straight from SQLite."""
+    import sqlite3 as _sqlite3
+
+    from app.db import db_path
+
+    conn = _sqlite3.connect(db_path())
+    conn.row_factory = _sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT device_id, seq, revision, status, installed_id, "
+            "expected_id FROM receipts WHERE channel = ? ORDER BY device_id",
+            (name,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_receipt_validation(client, monkeypatch):
+    _, candidate = make_named_channel(client, monkeypatch, "rc-val")
+
+    def code(payload, name="rc-val"):
+        return client.post(f"/channels/{name}/receipts",
+                           json=payload).status_code
+
+    base = {"device_id": "d1", "revision": 1, "seq": 1,
+            "status": "success", "installed_id": candidate}
+    assert code(base) == 200
+
+    # seq must be a positive integer
+    for bad in (0, -1, 1.5, "x"):
+        assert code({**base, "seq": bad}) == 422
+    # revision must be a positive integer
+    for bad in (0, -2, 1.5, "x"):
+        assert code({**base, "revision": bad}) == 422
+    # status must be exactly success/failed
+    assert code({**base, "status": "ok"}) == 422
+    assert code({**base, "status": "SUCCESS"}) == 422
+    # success requires a non-empty installed_id
+    missing = {**base, "seq": 2}
+    del missing["installed_id"]
+    assert code(missing) == 422
+    assert code({**base, "seq": 2, "installed_id": None}) == 422
+    assert code({**base, "seq": 2, "installed_id": ""}) == 422
+    assert code({**base, "seq": 2, "installed_id": "x" * 65}) == 422
+    # failed must not carry an installed_id
+    assert code({**base, "seq": 2, "status": "failed",
+                 "installed_id": candidate}) == 422
+    assert code({**base, "seq": 2, "status": "failed",
+                 "installed_id": ""}) == 422
+    # missing fields / empty device_id
+    assert code({}) == 422
+    assert code({**base, "device_id": ""}) == 422
+    # failed without installed_id (absent or explicit null) is accepted
+    assert code({"device_id": "d2", "revision": 1, "seq": 1,
+                 "status": "failed"}) == 200
+    r = client.post("/channels/rc-val/receipts",
+                    json={"device_id": "d2", "revision": 1, "seq": 1,
+                          "status": "failed", "installed_id": None})
+    assert r.status_code == 200 and r.json()["stored"] == "unchanged"
+    # unknown channel -> 404 on both endpoints
+    assert code(base, name="rc-nope") == 404
+    assert client.get("/channels/rc-nope/installation-audit").status_code == 404
+
+
+def test_receipt_flow_and_audit(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-flow",
+                                           percent=100)
+
+    # percent=100: every device resolves to the candidate image
+    r = post_receipt(client, "rc-flow", "dev-1", 1, "success", candidate)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_id"] == candidate
+    assert body["matched"] is True
+    assert body["stored"] == "recorded"
+    assert body["revision"] == 1 and body["seq"] == 1
+
+    # success but installed something else -> deviation
+    r = post_receipt(client, "rc-flow", "dev-2", 1, "success", stable)
+    assert r.status_code == 200
+    assert r.json()["expected_id"] == candidate
+    assert r.json()["matched"] is False
+
+    # failed install: no installed_id
+    r = post_receipt(client, "rc-flow", "dev-3", 1, "failed")
+    assert r.status_code == 200
+    assert r.json()["installed_id"] is None
+    assert r.json()["matched"] is False
+
+    body = audit(client, "rc-flow")
+    assert body["revision"] == 1
+    assert body["success_matched"] == 1
+    assert body["success_deviated"] == 1
+    assert body["failed"] == 1
+
+
+def test_receipt_expected_follows_resolution_rules(client, monkeypatch):
+    # percent=0: every device resolves to the stable image
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-exp0",
+                                           percent=0)
+    r = post_receipt(client, "rc-exp0", "dev-1", 1, "success", stable)
+    assert r.json()["expected_id"] == stable
+
+    # percent=50: the frozen expected_id follows the reference bucket rule
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-exp50",
+                                           percent=50)
+    saw = {stable: 0, candidate: 0}
+    for i in range(20):
+        dev = f"dev-{i}-核"
+        r = post_receipt(client, "rc-exp50", dev, 1, "failed")
+        assert r.status_code == 200, r.text
+        expected = (candidate
+                    if ref_channel_bucket("rc-exp50", dev) < 50 * 100
+                    else stable)
+        assert r.json()["expected_id"] == expected
+        saw[expected] += 1
+    assert saw[stable] > 0 and saw[candidate] > 0  # both paths exercised
+
+
+def test_receipt_revision_gate_and_cross_revision_seq(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-rev",
+                                           percent=100)
+
+    # stale and future revisions are both rejected; nothing is stored
+    assert post_receipt(client, "rc-rev", "dev-1", 1, "success", candidate,
+                        revision=2).status_code == 409
+    assert post_receipt(client, "rc-rev", "dev-1", 1, "success", candidate,
+                        revision=99).status_code == 409
+    assert _receipt_rows("rc-rev") == []
+
+    assert post_receipt(client, "rc-rev", "dev-1", 1, "success",
+                        candidate).status_code == 200
+
+    # bump the channel to revision 2
+    r = client.put("/channels/rc-rev", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 1,
+    })
+    assert r.status_code == 200 and r.json()["revision"] == 2
+
+    # a delayed report for the old revision is rejected and overwrites nothing
+    assert post_receipt(client, "rc-rev", "dev-1", 2, "failed",
+                        revision=1).status_code == 409
+    rows = _receipt_rows("rc-rev")
+    assert len(rows) == 1
+    assert rows[0]["revision"] == 1 and rows[0]["status"] == "success"
+
+    # the audit counts only the current revision
+    body = audit(client, "rc-rev")
+    assert body["revision"] == 2
+    assert (body["success_matched"], body["success_deviated"],
+            body["failed"]) == (0, 0, 0)
+
+    # seq is monotonic across revisions: reusing seq 1 under revision 2
+    # conflicts with the stored row; a larger seq is accepted and replaces it
+    assert post_receipt(client, "rc-rev", "dev-1", 1, "failed",
+                        revision=2).status_code == 409
+    r = post_receipt(client, "rc-rev", "dev-1", 2, "failed", revision=2)
+    assert r.status_code == 200 and r.json()["stored"] == "replaced"
+    body = audit(client, "rc-rev")
+    assert body["failed"] == 1 and body["success_matched"] == 0
+
+
+def test_receipt_seq_rules(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-seq",
+                                           percent=100)
+
+    r = post_receipt(client, "rc-seq", "dev-1", 5, "success", candidate)
+    assert r.status_code == 200 and r.json()["stored"] == "recorded"
+
+    # smaller seq -> 409
+    assert post_receipt(client, "rc-seq", "dev-1", 4, "success",
+                        candidate).status_code == 409
+    # same seq, different content -> 409
+    assert post_receipt(client, "rc-seq", "dev-1", 5, "failed").status_code == 409
+    assert post_receipt(client, "rc-seq", "dev-1", 5, "success",
+                        stable).status_code == 409
+    # same seq, same content -> idempotent, returns the stored row
+    r = post_receipt(client, "rc-seq", "dev-1", 5, "success", candidate)
+    assert r.status_code == 200
+    assert r.json()["stored"] == "unchanged"
+    assert r.json()["expected_id"] == candidate
+    # larger seq replaces; the audit then reflects only the newest receipt
+    r = post_receipt(client, "rc-seq", "dev-1", 6, "failed")
+    assert r.status_code == 200 and r.json()["stored"] == "replaced"
+    body = audit(client, "rc-seq")
+    assert body["success_matched"] == 0 and body["failed"] == 1
+    # the superseded content at the old seq stays a conflict
+    assert post_receipt(client, "rc-seq", "dev-1", 5, "success",
+                        candidate).status_code == 409
+    # independent devices have independent sequences
+    assert post_receipt(client, "rc-seq", "dev-2", 1, "success",
+                        candidate).status_code == 200
+
+
+def test_receipt_stable_untrusted_rejected(client, monkeypatch):
+    # disjoint key pairs per image, so rotation kills one image's trust only
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    all_keys = {"ops": pk_s1, "ci": pk_s2, "ops2": pk_c1, "ci2": pk_c2}
+    set_keys(monkeypatch, all_keys)
+    stable = finalize_trusted(client, os.urandom(300), {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/rc-untrusted", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+
+    # stable loses trust -> receipts are rejected and nothing is stored
+    set_keys(monkeypatch, {"ops2": pk_c1, "ci2": pk_c2})
+    assert post_receipt(client, "rc-untrusted", "dev-1", 1, "success",
+                        candidate).status_code == 409
+    assert _receipt_rows("rc-untrusted") == []
+    body = audit(client, "rc-untrusted")
+    assert (body["success_matched"], body["success_deviated"],
+            body["failed"]) == (0, 0, 0)
+
+    # trust restored -> the very same report is accepted
+    set_keys(monkeypatch, all_keys)
+    r = post_receipt(client, "rc-untrusted", "dev-1", 1, "success", candidate)
+    assert r.status_code == 200 and r.json()["expected_id"] == candidate
+
+
+def test_receipt_expected_frozen_despite_later_changes(client, monkeypatch):
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    all_keys = {"ops": pk_s1, "ci": pk_s2, "ops2": pk_c1, "ci2": pk_c2}
+    set_keys(monkeypatch, all_keys)
+    stable = finalize_trusted(client, os.urandom(300), {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/rc-frozen", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+
+    # candidate trusted at acceptance: expected_id freezes to the candidate
+    r = post_receipt(client, "rc-frozen", "dev-1", 1, "success", candidate)
+    assert r.json()["expected_id"] == candidate
+
+    # candidate's keys rotated out afterwards: live resolution would now
+    # fall back to stable, but the saved expected_id is NOT rewritten
+    set_keys(monkeypatch, {"ops": pk_s1, "ci": pk_s2})
+    body = audit(client, "rc-frozen")
+    assert body["success_matched"] == 1 and body["success_deviated"] == 0
+
+    # an idempotent replay returns the frozen row exactly as stored
+    r = post_receipt(client, "rc-frozen", "dev-1", 1, "success", candidate)
+    assert r.status_code == 200
+    assert r.json()["stored"] == "unchanged"
+    assert r.json()["expected_id"] == candidate
+
+    # a NEW receipt now resolves to the stable fallback
+    r = post_receipt(client, "rc-frozen", "dev-2", 1, "success", stable)
+    assert r.json()["expected_id"] == stable
+    assert audit(client, "rc-frozen")["success_matched"] == 2
+
+    # a policy change bumps the revision; old receipts keep their frozen
+    # expected_id and drop out of the audit
+    set_keys(monkeypatch, all_keys)
+    r = client.put("/channels/rc-frozen", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 0, "expected_revision": 1,
+    })
+    assert r.status_code == 200 and r.json()["revision"] == 2
+    body = audit(client, "rc-frozen")
+    assert body["revision"] == 2
+    assert (body["success_matched"], body["success_deviated"],
+            body["failed"]) == (0, 0, 0)
+    frozen = {row["device_id"]: row["expected_id"]
+              for row in _receipt_rows("rc-frozen")}
+    assert frozen == {"dev-1": candidate, "dev-2": stable}
+
+
+def test_receipts_persist_across_restart(client, monkeypatch):
+    _, candidate = make_named_channel(client, monkeypatch, "rc-lts",
+                                      percent=100)
+    post_receipt(client, "rc-lts", "dev-1", 3, "success", candidate)
+    post_receipt(client, "rc-lts", "dev-2", 1, "failed")
+
+    # Simulate a container rebuild: a fresh TestClient over the same DB file.
+    with TestClient(app) as c2:
+        body = c2.get("/channels/rc-lts/installation-audit").json()
+        assert body["success_matched"] == 1 and body["failed"] == 1
+        # idempotent replay is still recognized after the rebuild
+        r = c2.post("/channels/rc-lts/receipts", json={
+            "device_id": "dev-1", "revision": 1, "seq": 3,
+            "status": "success", "installed_id": candidate,
+        })
+        assert r.status_code == 200 and r.json()["stored"] == "unchanged"
+        # and the seq guard survived too
+        r = c2.post("/channels/rc-lts/receipts", json={
+            "device_id": "dev-1", "revision": 1, "seq": 2,
+            "status": "success", "installed_id": candidate,
+        })
+        assert r.status_code == 409
+
+
+def test_receipts_race_channel_update_by_commit_order(client, monkeypatch):
+    """Receipts and channel updates serialize on the same per-channel lock
+    and SQLite write transactions: a receipt either commits before the
+    update (stored under the old revision) or after it (409 stale
+    revision).  No 500s; delayed old-revision reports never land."""
+    import concurrent.futures
+
+    stable, candidate = make_named_channel(client, monkeypatch, "rc-race",
+                                           percent=100)
+
+    def report(i):
+        return client.post("/channels/rc-race/receipts", json={
+            "device_id": f"dev-{i}", "revision": 1, "seq": 1,
+            "status": "success", "installed_id": candidate,
+        }).status_code
+
+    def bump():
+        return client.put("/channels/rc-race", json={
+            "stable_id": stable, "candidate_id": candidate,
+            "percent": 100, "expected_revision": 1,
+        }).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as pool:
+        futs = [pool.submit(report, i) for i in range(16)]
+        bump_fut = pool.submit(bump)
+        codes = [f.result() for f in futs]
+        assert bump_fut.result() == 200
+
+    assert set(codes) <= {200, 409}, codes
+    stored = _receipt_rows("rc-race")
+    # every stored receipt was accepted under revision 1; every 200 reporter
+    # has exactly one row; 409 reporters never landed
+    assert all(r["revision"] == 1 for r in stored)
+    assert len(stored) == codes.count(200)
+
+    # the audit counts only the current revision (2): nothing
+    body = audit(client, "rc-race")
+    assert body["revision"] == 2
+    assert (body["success_matched"], body["success_deviated"],
+            body["failed"]) == (0, 0, 0)
+
+    # delayed old-revision reports are rejected and change nothing
+    assert post_receipt(client, "rc-race", "dev-late", 1, "success",
+                        candidate, revision=1).status_code == 409
+    assert len(_receipt_rows("rc-race")) == len(stored)

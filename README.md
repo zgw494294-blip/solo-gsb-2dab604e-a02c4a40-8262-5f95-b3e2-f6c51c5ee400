@@ -5,9 +5,10 @@
 SHA-256 校验通过后封存镜像，封存后只读并支持原始内容下载。已封存的镜像可接收
 Ed25519 签名（attestation），服务端按**当前配置的公钥**实时重验，达到阈值即判定
 可信。在此之上提供**灰度发布通道**：稳定/候选镜像按设备确定性分桶，解析时实时
-重验可信并自动回退。超过闲置时长的**未封存**任务可由 `POST /images/cleanup`
-连同分片一并回收，封存镜像、签名与通道始终保留。任务、分片、签名与通道策略全部
-落盘，容器重建后数据不丢。
+重验可信并自动回退；设备安装后向通道**上报回执**，服务端在接收时按决议规则
+冻结应装镜像，并按当前修订号核对成功匹配/偏离/失败的设备数。超过闲置时长的**未封存**任务可由 `POST /images/cleanup`
+连同分片一并回收，封存镜像、签名与通道始终保留。任务、分片、签名、通道策略与
+设备回执全部落盘，容器重建后数据不丢。
 
 ## 一键启动（Docker Compose）
 
@@ -63,6 +64,8 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET    | `/images/{id}/trust`              | 按当前公钥重新验签，返回可信判定 |
 | PUT    | `/channels/{name}`                | 创建/更新灰度发布通道（`expected_revision` 乐观并发校验） |
 | GET    | `/channels/{name}/resolve?device_id=...` | 按设备确定性解析灰度通道，实时重验可信并回退 |
+| POST   | `/channels/{name}/receipts`       | 上报设备安装回执（仅接受当前修订号，接收时冻结应装镜像） |
+| GET    | `/channels/{name}/installation-audit` | 按当前修订号统计成功匹配/成功偏离/失败的设备数 |
 | GET    | `/health`                         | 存活探针 |
 
 ### 限制
@@ -89,9 +92,9 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 200    | 分片上传/查询/封存/下载/签名提交/可信查询成功 |
 | 400    | 分片为空或区间越界；签名接口的 `key_id` 未知、Base64 编码错误或签名无效（均不落库） |
 | 404    | 任务不存在（增量接口中基础镜像或目标镜像任一不存在均返回 404）；通道不存在；`PUT /channels` 中稳定或候选镜像不存在 |
-| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信 |
+| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信；回执修订号非当前值、序号小于已存值或同序号内容不同、上报时稳定镜像失信 |
 | 413    | 分片超过 1 MiB |
-| 422    | 请求参数校验失败（JSON 字段、offset 为负等）；`proof` 的 `indices` 非法（为空、超过 64 个、重复、负数、非整数或超出叶范围）；`cleanup` 的 `idle_seconds` 非正整数或 `limit` 不在 1～100 |
+| 422    | 请求参数校验失败（JSON 字段、offset 为负等）；`proof` 的 `indices` 非法（为空、超过 64 个、重复、负数、非整数或超出叶范围）；`cleanup` 的 `idle_seconds` 非正整数或 `limit` 不在 1～100；回执的 `seq`/`revision` 非正整数、`status` 非法、`success` 缺 `installed_id` 或 `failed` 携带 `installed_id` |
 
 ## 使用示例
 
@@ -611,6 +614,72 @@ def bucket(name: str, device_id: str) -> int:
 assert bucket("release-1", "dev-0042") == 8202  # 与响应中的 bucket 一致
 ```
 
+## 灰度安装回执核对（Installation Receipts）
+
+设备完成（或失败）一次安装后向通道上报回执；服务端在**接收时**按灰度决议规则
+算出该设备的**应装镜像**并随回执冻结保存，之后可随时按通道核对安装结果。回执
+持久化在 SQLite `receipts` 表中，随命名卷与通道一起跨重建保留。
+
+### 上报回执
+
+```
+POST /channels/{name}/receipts
+{"device_id":"dev-0042","revision":2,"seq":7,"status":"success","installed_id":"…"}
+```
+
+- `revision`：**仅接受通道当前修订号**。通道更新后，旧修订号的延迟上报一律
+  返回 **409**，不会覆盖新数据。
+- `seq`：**正整数**，设备级序号，跨修订号单调递增。每个（通道，设备）只保留
+  序号最大的回执：
+  - 序号小于已存值 → **409**；
+  - 序号相同但内容（`revision` / `status` / `installed_id`）不同 → **409**；
+  - 序号相同且内容相同 → 幂等成功，返回已存回执（`stored:"unchanged"`，
+    含冻结的 `expected_id`）；
+  - 序号更大 → 覆盖已存回执（`stored:"replaced"`；新设备为 `"recorded"`）。
+- `status`：`success` 时必须携带非空 `installed_id`；`failed` 时
+  `installed_id` 必须为 `null`（或省略），否则 **422**。
+- 接收时在**同一个 SQLite 写事务**内按现有决议规则（设备分桶 + 实时重验 +
+  候选失信回退）计算 `expected_id` 并随回执落库；**稳定镜像失信时拒收**
+  （**409**），不落库。通道不存在返回 **404**。
+
+```bash
+# 成功上报（revision 须为通道当前修订号；seq 逐次递增、跨修订号不回退）
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"dev-0042\",\"revision\":2,\"seq\":7,
+       \"status\":\"success\",\"installed_id\":\"$CANDIDATE_ID\"}"
+# -> {"name":"release-1","device_id":"dev-0042","revision":2,"seq":7,
+#     "status":"success","installed_id":"…","expected_id":"…",
+#     "matched":true,"stored":"recorded"}
+
+# 失败上报不带 installed_id
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev-0043","revision":2,"seq":1,"status":"failed"}'
+```
+
+响应中 `expected_id` 为接收时冻结的应装镜像；`matched` 表示本次上报成功且
+实装与应装一致；`stored` 为 `recorded` / `replaced` / `unchanged`。
+
+### 核对安装结果
+
+```
+GET /channels/{name}/installation-audit
+```
+
+```bash
+curl -s "localhost:8000/channels/release-1/installation-audit"
+# -> {"name":"release-1","revision":2,
+#     "success_matched":18,"success_deviated":2,"failed":1}
+```
+
+- 只统计**当前修订号**的回执；旧修订号的回执保留在库中但不计入。
+- `success_matched`：上报成功且 `installed_id` 等于冻结的 `expected_id`；
+  `success_deviated`：上报成功但实装了别的镜像；`failed`：上报失败。
+  每台设备只按其最新回执计入一次。
+- `expected_id` 在接收时冻结，**之后的策略调整或公钥轮换都不会改写它**，
+  核对始终按接收时的决议结果进行。通道不存在返回 **404**。
+
 ## 一致性与并发设计
 
 - **原子校验-写入**：每次分片上传在一个 `BEGIN IMMEDIATE` 事务中完成
@@ -644,9 +713,19 @@ assert bucket("release-1", "dev-0042") == 8202  # 与响应中的 bucket 一致
   以固定大小分片顺序扫描已封存字节并在线建树；内存占用只随叶数（每叶一个
   32 字节哈希）与本次请求返回的块数（至多 64 块）增长，**不随镜像总长增长**。
   树不落库、无状态，每次请求从已封存字节重算，因此历史封存镜像无需迁移。
-- **持久化**：全部状态（任务、分片字节、封存标志、签名、灰度通道策略与修订号）
-  都在 SQLite 中；配合 Compose 命名卷，容器/镜像重建后任务、分片、签名与通道
-  继续可用。通道的可信判定不缓存：解析时按当前公钥实时重验。
+- **回执与通道更新按提交顺序裁决**：`POST /channels/{name}/receipts` 与
+  `PUT /channels/{name}` 共用同一把进程内通道锁，并各自在单个
+  `BEGIN IMMEDIATE` 事务内完成"读通道 → 校验修订号 → 决议应装镜像 → 落库"。
+  仅接受通道当前修订号：先提交的通道更新使后续旧修订号上报一律 409，旧修订号
+  的延迟上报永远不能覆盖新数据。每个（通道，设备）只保留 `seq` 最大的回执
+  （`seq` 跨修订号单调递增）：更小序号或同序号不同内容 409，同序号同内容幂等。
+  `expected_id` 在接收事务内按决议规则算出并冻结，后续策略调整或公钥轮换均不
+  改写；`installation-audit` 只统计当前修订号，按冻结值判定匹配/偏离/失败，
+  稳定镜像失信时拒收且不落库。
+- **持久化**：全部状态（任务、分片字节、封存标志、签名、灰度通道策略与修订号、
+  设备安装回执）都在 SQLite 中；配合 Compose 命名卷，容器/镜像重建后任务、
+  分片、签名、通道与回执继续可用。通道的可信判定不缓存：解析与回执接收时均按
+  当前公钥实时重验。
 - 服务默认以**单个 uvicorn worker** 运行（见 Dockerfile CMD）。单 worker
   配合线程池即可并发处理请求，且与单文件 SQLite 的写模型最为匹配。
 
@@ -672,7 +751,14 @@ python -m pytest tests/ -v
 灰度通道覆盖参数校验 422、首建/更新修订号校验 409、镜像不存在 404、未封存/
 未达可信阈值 409、拒绝调用不落库、按参考实现逐设备对拍桶号与选边（含非 ASCII
 device_id）、`percent` 取 0/100 的边界行为、候选失信回退稳定镜像、稳定镜像
-失信 409，以及模拟容器重建后策略与同设备决议完全一致；闲置回收覆盖参数校验
+失信 409，以及模拟容器重建后策略与同设备决议完全一致；安装回执覆盖参数校验
+422（`seq`/`revision` 非正整数、`status` 非法、`success` 缺 `installed_id`、
+`failed` 携带 `installed_id` 等）、通道不存在 404、非当前修订号 409 且不落库、
+应装镜像按参考分桶规则逐设备对拍（含非 ASCII device_id）、稳定镜像失信拒收、
+序号规则（更小 409、同号不同内容 409、同号同内容幂等、更大覆盖且核对随之更新）、
+序号跨修订号递增、核对接口只统计当前修订号且按冻结 `expected_id` 判定、公钥
+轮换与策略更新不改写已存应装结果、模拟容器重建后回执与幂等性保持，以及与通道
+更新并发时按事务提交顺序裁决（旧修订号延迟上报不覆盖新数据）；闲置回收覆盖参数校验
 422（`idle_seconds` 非正、`limit` 越界/非整数/缺失）、只回收未封存且到期任务、
 释放字节数按不相交区间精确统计、`limit` 截断与 `(last_activity_at, id)` 排序
 （含同时间戳按 ID 破并）、重复调用逐批清空、成功上传（含重复分片）刷新活动时间、

@@ -32,6 +32,17 @@ candidate image ids, the canary percentage and an optimistic-concurrency
 revision that bumps on every accepted update.  Both images are validated
 (exist, sealed, currently trusted) on every PUT; resolution re-derives
 trust live, so the stored row is policy only, never a trust cache.
+
+``receipts`` holds at most one installation receipt per (channel,
+device_id): the device's latest report.  ``seq`` is a per-device sequence
+number that must strictly increase for a report to replace the stored one
+(monotonic across channel revisions); ``revision`` is the channel revision
+the report was accepted under (only the channel's *current* revision is
+accepted); ``expected_id`` is the image the device should have installed,
+computed by the channel's resolution rules inside the same write
+transaction that stored the receipt and never rewritten afterwards —
+later policy or public-key changes do not alter it, and the
+installation-audit endpoint reads it back as saved.
 """
 
 from __future__ import annotations
@@ -121,6 +132,23 @@ def init_db(path: Optional[str] = None) -> None:
                 updated_at   TEXT NOT NULL,
                 FOREIGN KEY (stable_id) REFERENCES images (id),
                 FOREIGN KEY (candidate_id) REFERENCES images (id)
+            ) WITHOUT ROWID;
+
+            -- One row per (channel, device_id): the device's latest
+            -- installation receipt.  `seq` strictly increases for a report
+            -- to replace the stored one (monotonic across revisions);
+            -- `expected_id` is frozen at acceptance time.
+            CREATE TABLE IF NOT EXISTS receipts (
+                channel      TEXT    NOT NULL,
+                device_id    TEXT    NOT NULL,
+                seq          INTEGER NOT NULL,
+                revision     INTEGER NOT NULL,
+                status       TEXT    NOT NULL,
+                installed_id TEXT,
+                expected_id  TEXT    NOT NULL,
+                created_at   TEXT    NOT NULL,
+                PRIMARY KEY (channel, device_id),
+                FOREIGN KEY (channel) REFERENCES channels (name)
             ) WITHOUT ROWID;
             """
         )
