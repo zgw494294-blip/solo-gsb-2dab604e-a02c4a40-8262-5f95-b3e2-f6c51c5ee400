@@ -1309,6 +1309,476 @@ def test_channel_survives_rebuild_and_resolves_identically(client, monkeypatch):
         assert c2.get("/channels/lts/resolve",
                       params={"device_id": "dev-42"}).json()["revision"] == 2
 
+
+# --------------------------------------------------------------------------- #
+# Installation receipts & installation audit
+# --------------------------------------------------------------------------- #
+
+
+def _expected_for(client, name: str, device_id: str) -> dict:
+    """What the current policy says the device should install."""
+    r = client.get(f"/channels/{name}/resolve", params={"device_id": device_id})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _audit(client, name: str) -> dict:
+    r = client.get(f"/channels/{name}/installation-audit")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_receipt_request_validation(client, monkeypatch):
+    stable, candidate = make_channel_images(client, monkeypatch)
+    assert client.put("/channels/rcpt", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 50, "expected_revision": 0,
+    }).status_code == 200
+    expected = _expected_for(client, "rcpt", "dev-1")["image_id"]
+
+    base = {"device_id": "dev-1", "revision": 1, "seq": 1,
+            "status": "success", "installed_id": expected}
+
+    def post(**override):
+        return client.post("/channels/rcpt/receipts", json={**base, **override})
+
+    # success without an installed id -> 422; failed with one -> 422
+    assert post(installed_id=None).status_code == 422
+    assert post(installed_id="").status_code == 422
+    assert post(status="failed", installed_id=expected).status_code == 422
+    # failed with an explicit empty string is accepted and normalized to ""
+    assert post(status="failed", installed_id="").status_code == 200
+    # unknown status / non-positive seq and revision / missing device -> 422
+    assert post(status="bogus", installed_id=None).status_code == 422
+    assert post(seq=0).status_code == 422
+    assert post(seq=2.5).status_code == 422
+    assert post(revision=0).status_code == 422
+    assert post(device_id="").status_code == 422
+
+    # a failed receipt may omit installed_id entirely and stores it empty
+    r = client.post("/channels/rcpt/receipts",
+                    json={"device_id": "dev-1", "revision": 1,
+                          "seq": 1, "status": "failed"})
+    assert r.status_code == 200, r.text
+    assert r.json()["installed_id"] == ""
+
+    # unknown channel -> 404
+    assert client.post("/channels/nope/receipts",
+                       json=base).status_code == 404
+    assert client.get("/channels/nope/installation-audit").status_code == 404
+
+
+def test_receipt_freeze_expected_and_idempotency(client, monkeypatch):
+    stable, candidate = make_channel_images(client, monkeypatch)
+    assert client.put("/channels/freeze", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+
+    # success that matches the expected (candidate) image
+    r = client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-A", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": candidate,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"] == "recorded"
+    assert body["expected_image_id"] == candidate
+    assert body["expected_reason"] == "candidate"
+
+    # same seq, identical content -> idempotent, identical snapshot
+    r2 = client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-A", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": candidate,
+    })
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["result"] == "unchanged"
+    assert b2["expected_image_id"] == body["expected_image_id"]
+    assert b2["created_at"] == body["created_at"]
+
+    # same seq, different content (drifted install id) -> 409, row untouched
+    r3 = client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-A", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": stable,
+    })
+    assert r3.status_code == 409
+    assert _audit(client, "freeze")["success_match"] == 1
+
+    # smaller seq -> 409
+    assert client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-A", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": candidate,
+    }).json()["result"] == "unchanged"
+
+    # a distinct device reporting failure: failed receipts carry no image
+    r = client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-B", "revision": 1, "seq": 3, "status": "failed",
+    })
+    assert r.status_code == 200
+    assert r.json()["expected_image_id"] == candidate
+    # smaller seq for that device -> 409
+    assert client.post("/channels/freeze/receipts", json={
+        "device_id": "dev-B", "revision": 1, "seq": 2, "status": "failed",
+    }).status_code == 409
+    audit = _audit(client, "freeze")
+    assert audit["success_match"] == 1 and audit["failed"] == 1
+
+
+def test_receipt_seq_grows_across_revisions_and_audit_filters(client, monkeypatch):
+    stable, candidate = make_channel_images(client, monkeypatch)
+    assert client.put("/channels/move", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 50, "expected_revision": 0,
+    }).status_code == 200
+
+    dev = "dev-cross"
+    expected_r1 = _expected_for(client, "move", dev)
+    assert expected_r1["revision"] == 1
+    # revision 1 failure at seq 5
+    r = client.post("/channels/move/receipts", json={
+        "device_id": dev, "revision": 1, "seq": 5, "status": "failed",
+    })
+    assert r.status_code == 200
+    assert _audit(client, "move") == {
+        "name": "move", "revision": 1,
+        "success_match": 0, "success_drift": 0, "failed": 1,
+        "reported_devices": 1,
+    }
+
+    # move the channel on to revision 2 ...
+    assert client.put("/channels/move", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 75, "expected_revision": 1,
+    }).status_code == 200
+
+    # ... a delayed report for the OLD revision is now rejected even with a
+    # higher seq, and cannot overwrite the stored current data
+    assert client.post("/channels/move/receipts", json={
+        "device_id": dev, "revision": 1, "seq": 99, "status": "failed",
+    }).status_code == 409
+
+    # seq is monotonic ACROSS revisions: seq 4 at the new revision loses to 5
+    assert client.post("/channels/move/receipts", json={
+        "device_id": dev, "revision": 2, "seq": 4,
+        "status": "success", "installed_id": stable,
+    }).status_code == 409
+
+    # seq 6 at revision 2 supersedes; audit now counts only revision 2
+    expected_r2 = _expected_for(client, "move", dev)
+    assert expected_r2["revision"] == 2
+    r = client.post("/channels/move/receipts", json={
+        "device_id": dev, "revision": 2, "seq": 6,
+        "status": "success", "installed_id": expected_r2["image_id"],
+    })
+    assert r.status_code == 200 and r.json()["result"] == "recorded"
+    audit = _audit(client, "move")
+    assert audit["revision"] == 2
+    assert audit["reported_devices"] == 1
+    # the old revision-1 failure no longer counts
+    assert audit["failed"] == 0 and audit["success_match"] == 1
+
+    # the superseded row is gone (one row per channel/device): the surviving
+    # row is exactly the revision-2, seq-6 receipt.
+    import sqlite3 as _sqlite3
+    from app.db import db_path as _db_path
+    sconn = _sqlite3.connect(_db_path())
+    try:
+        rows = sconn.execute(
+            "SELECT revision, seq FROM receipts "
+            "WHERE channel_name = 'move' AND device_id = ?", (dev,),
+        ).fetchall()
+        assert rows == [(2, 6)]
+    finally:
+        sconn.close()
+
+
+def test_receipt_audit_match_drift_failure_counts(client, monkeypatch):
+    stable, candidate = make_channel_images(client, monkeypatch)
+    assert client.put("/channels/counts", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+
+    def report(device, seq, status, installed=None):
+        body = {"device_id": device, "revision": 1, "seq": seq,
+                "status": status}
+        if installed is not None:
+            body["installed_id"] = installed
+        r = client.post("/channels/counts/receipts", json=body)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    # every device is bucketed to candidate at percent=100
+    m1 = report("m1", 1, "success", candidate)
+    assert m1["expected_image_id"] == candidate
+    report("m2", 1, "success", candidate)             # second match
+    report("d1", 1, "success", stable)                # drifted
+    report("f1", 1, "failed")                         # failure
+    report("f2", 1, "failed")                         # failure
+    # a device's later, higher seq flips its classification
+    report("f2", 2, "success", candidate)             # now a match
+
+    audit = _audit(client, "counts")
+    assert audit == {
+        "name": "counts", "revision": 1,
+        "success_match": 3, "success_drift": 1,
+        "failed": 1, "reported_devices": 5,
+    }
+
+
+def test_receipt_stable_untrusted_is_rejected_but_idempotent_replay_ok(
+    client, monkeypatch
+):
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    set_keys(monkeypatch, {"ops": pk_s1, "ci": pk_s2,
+                           "ops2": pk_c1, "ci2": pk_c2})
+    stable = finalize_trusted(client, os.urandom(300),
+                              {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/trust-rcpt", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 0, "expected_revision": 0,
+    }).status_code == 200
+
+    # accept a receipt while everything is trusted
+    r = client.post("/channels/trust-rcpt/receipts", json={
+        "device_id": "dev-9", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": stable,
+    })
+    assert r.status_code == 200
+    assert r.json()["expected_image_id"] == stable
+
+    # rotate the stable image's keys out: the channel can no longer resolve
+    set_keys(monkeypatch, {"ops2": pk_c1, "ci2": pk_c2})
+    assert client.get("/channels/trust-rcpt/resolve",
+                      params={"device_id": "dev-9"}).status_code == 409
+    assert client.post("/channels/trust-rcpt/receipts", json={
+        "device_id": "dev-9", "revision": 1, "seq": 2,
+        "status": "failed",
+    }).status_code == 409
+
+    # an identical replay of seq 1 stays idempotent and returns the snapshot
+    r = client.post("/channels/trust-rcpt/receipts", json={
+        "device_id": "dev-9", "revision": 1, "seq": 1,
+        "status": "success", "installed_id": stable,
+    })
+    assert r.status_code == 200
+    assert r.json()["result"] == "unchanged"
+    assert r.json()["expected_image_id"] == stable
+
+    # the audit still reads the frozen snapshots (no live trust check)
+    audit = _audit(client, "trust-rcpt")
+    assert audit["success_match"] == 1
+
+
+def test_receipt_frozen_snapshot_survives_policy_and_key_changes(
+    client, monkeypatch
+):
+    sk1, pk1 = gen_key()
+    sk2, pk2 = gen_key()
+    sk3, pk3 = gen_key()
+    sk4, pk4 = gen_key()
+    set_keys(monkeypatch, {"ops": pk1, "ci": pk2})
+    stable1 = finalize_trusted(client, os.urandom(300),
+                               {"ops": sk1, "ci": sk2})
+    candidate1 = finalize_trusted(client, os.urandom(300),
+                                  {"ops": sk1, "ci": sk2})
+    assert client.put("/channels/snap", json={
+        "stable_id": stable1, "candidate_id": candidate1,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+
+    dev = "dev-snap"
+    r = client.post("/channels/snap/receipts", json={
+        "device_id": dev, "revision": 1, "seq": 1,
+        "status": "success", "installed_id": stable1,  # a drift at rev 1
+    })
+    assert r.status_code == 200
+    assert r.json()["expected_image_id"] == candidate1
+    assert _audit(client, "snap")["success_drift"] == 1
+
+    # new policy: rotate in a fresh stable/candidate, bump to revision 2
+    set_keys(monkeypatch, {"ops": pk3, "ci": pk4})
+    stable2 = finalize_trusted(client, os.urandom(300),
+                               {"ops": sk3, "ci": sk4})
+    candidate2 = finalize_trusted(client, os.urandom(300),
+                                  {"ops": sk3, "ci": sk4})
+    assert client.put("/channels/snap", json={
+        "stable_id": stable2, "candidate_id": candidate2,
+        "percent": 100, "expected_revision": 1,
+    }).status_code == 200
+
+    # revision-1 audit row is gone from the current audit...
+    audit = _audit(client, "snap")
+    assert audit["revision"] == 2 and audit["reported_devices"] == 0
+
+    # ...and a new current-revision receipt is resolved against the NEW policy
+    r = client.post("/channels/snap/receipts", json={
+        "device_id": dev, "revision": 2, "seq": 2,
+        "status": "success", "installed_id": candidate2,
+    })
+    assert r.status_code == 200
+    assert r.json()["expected_image_id"] == candidate2
+
+    # later key rotation does not retroactively alter the saved decision:
+    # a fresh image under new keys cannot resolve, but the audit and an
+    # idempotent replay still show candidate2 as the frozen expected id.
+    set_keys(monkeypatch, {})
+    assert client.get("/channels/snap/resolve",
+                      params={"device_id": dev}).status_code == 409
+    assert _audit(client, "snap")["success_match"] == 1
+    r = client.post("/channels/snap/receipts", json={
+        "device_id": dev, "revision": 2, "seq": 2,
+        "status": "success", "installed_id": candidate2,
+    })
+    assert r.status_code == 200 and r.json()["result"] == "unchanged"
+    assert r.json()["expected_image_id"] == candidate2
+
+
+def test_receipts_survive_rebuild(client, monkeypatch):
+    stable, candidate = make_channel_images(client, monkeypatch)
+    assert client.put("/channels/persist-rcpt", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 50, "expected_revision": 0,
+    }).status_code == 200
+    assert client.post("/channels/persist-rcpt/receipts", json={
+        "device_id": "dev-p", "revision": 1, "seq": 7,
+        "status": "success", "installed_id": candidate,
+    }).status_code == 200
+
+    with TestClient(app) as c2:
+        audit = c2.get("/channels/persist-rcpt/installation-audit").json()
+        assert audit["revision"] == 1 and audit["reported_devices"] == 1
+        # monotonic seq and idempotency still enforced after a rebuild
+        assert c2.post("/channels/persist-rcpt/receipts", json={
+            "device_id": "dev-p", "revision": 1, "seq": 6,
+            "status": "failed",
+        }).status_code == 409
+        r = c2.post("/channels/persist-rcpt/receipts", json={
+            "device_id": "dev-p", "revision": 1, "seq": 7,
+            "status": "success", "installed_id": candidate,
+        })
+        assert r.status_code == 200 and r.json()["result"] == "unchanged"
+        assert r.json()["expected_image_id"] == candidate
+
+
+def test_receipts_arbitrate_with_channel_updates_by_commit_order(
+    client, monkeypatch
+):
+    """A storm of receipt reports interleaved with channel updates: no torn
+    state ever appears — every stored response matched its reported revision,
+    seq stays monotonic per device, and a stale revision never overwrites a
+    row committed against a newer revision."""
+    import concurrent.futures
+    import threading
+
+    stable, candidate = make_channel_images(client, monkeypatch)
+    name = "storm-rcpt"
+    assert client.put(f"/channels/{name}", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 50, "expected_revision": 0,
+    }).status_code == 200
+
+    devices = [f"dev-storm-{i}" for i in range(8)]
+    start = threading.Barrier(len(devices) + 1)
+    accepted = {d: [] for d in devices}  # (seq, revision) committed, in order
+    lock = threading.Lock()
+
+    def report(device):
+        start.wait()
+        local = []
+        for seq in range(1, 41):
+            # Learn the current revision, then report against it; a channel
+            # bump between the GET and POST costs one retry at the same seq.
+            for _attempt in range(100):
+                rv = client.get(f"/channels/{name}/resolve",
+                                params={"device_id": device}).json()["revision"]
+                r = client.post(f"/channels/{name}/receipts", json={
+                    "device_id": device, "revision": rv, "seq": seq,
+                    "status": "failed",
+                })
+                assert r.status_code != 500, r.text
+                if r.status_code == 200 and r.json()["result"] == "recorded":
+                    local.append((seq, r.json()["revision"],
+                                  r.json()["expected_image_id"]))
+                    break
+                if r.status_code == 200:
+                    break  # unchanged: a concurrent identical seq won
+                detail = str(r.json().get("detail", ""))
+                assert r.status_code == 409
+                assert ("revision" in detail) or ("seq" in detail)
+                if "older than stored seq" in detail:
+                    break  # a concurrent reporter for this device is ahead
+        with lock:
+            accepted[device] = local
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(devices) + 1) \
+            as pool:
+        futs = [pool.submit(report, d) for d in devices]
+
+        def update():
+            start.wait()
+            rev = 1
+            for _ in range(30):
+                r = client.put(f"/channels/{name}", json={
+                    "stable_id": stable, "candidate_id": candidate,
+                    "percent": 50, "expected_revision": rev,
+                })
+                if r.status_code == 200:
+                    rev = r.json()["revision"]
+            return rev
+
+        fu = pool.submit(update)
+        final_revision = fu.result()
+        for f in futs:
+            f.result()
+
+    assert final_revision >= 2  # the interleaving actually happened
+
+    import sqlite3 as _sqlite3
+    from app.db import db_path as _db_path
+    sconn = _sqlite3.connect(_db_path())
+    sconn.row_factory = _sqlite3.Row
+    try:
+        current_rev = sconn.execute(
+            "SELECT revision FROM channels WHERE name = ?", (name,)
+        ).fetchone()["revision"]
+        assert current_rev == final_revision
+        for device, rows in accepted.items():
+            # seqs accepted for one device are strictly increasing ...
+            seqs = [s for s, _, _ in rows]
+            assert seqs == sorted(set(seqs))
+            stored = sconn.execute(
+                "SELECT seq, revision, expected_image_id FROM receipts "
+                "WHERE channel_name = ? AND device_id = ?",
+                (name, device),
+            ).fetchone()
+            assert stored is not None
+            # ... and the single surviving row is exactly the greatest seq
+            # committed (the highest-seq accepted response wins).
+            assert stored["seq"] == seqs[-1]
+            committed = dict((s, (rev, img)) for s, rev, img in rows)
+            rev, img = committed[stored["seq"]]
+            assert stored["revision"] == rev
+            assert stored["expected_image_id"] == img
+            # a row committed against the newest revision cannot be carrying
+            # stale-revision content
+            if rev == current_rev:
+                assert stored["revision"] == current_rev
+    finally:
+        sconn.close()
+
+    # current-revision audit is internally consistent
+    audit = _audit(client, name)
+    assert audit["revision"] == final_revision
+    assert (audit["success_match"] + audit["success_drift"] + audit["failed"]
+            == audit["reported_devices"])
+
 # --------------------------------------------------------------------------- #
 # Idle reaping of unsealed tasks
 # --------------------------------------------------------------------------- #

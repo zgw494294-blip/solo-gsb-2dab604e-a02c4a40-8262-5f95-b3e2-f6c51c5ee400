@@ -32,6 +32,15 @@ candidate image ids, the canary percentage and an optimistic-concurrency
 revision that bumps on every accepted update.  Both images are validated
 (exist, sealed, currently trusted) on every PUT; resolution re-derives
 trust live, so the stored row is policy only, never a trust cache.
+
+``receipts`` holds, per (channel, device), exactly one installation
+receipt: the one with the greatest monotonically increasing ``seq`` ever
+accepted for that pair.  The ``revision`` the device reported is stored
+with it, as is the ``expected_image_id``/``expected_reason`` resolved by
+the server *inside the accepting transaction*: that snapshot is frozen
+forever — later policy or public-key changes neither rewrite it nor are
+able to make a stale receipt disappear, since audits count only rows
+whose revision still equals the channel's current revision.
 """
 
 from __future__ import annotations
@@ -121,6 +130,25 @@ def init_db(path: Optional[str] = None) -> None:
                 updated_at   TEXT NOT NULL,
                 FOREIGN KEY (stable_id) REFERENCES images (id),
                 FOREIGN KEY (candidate_id) REFERENCES images (id)
+            ) WITHOUT ROWID;
+
+            -- Exactly one row per (channel, device): the receipt with the
+            -- greatest accepted seq.  `revision` is the channel revision the
+            -- device reported against; expected_image_id/expected_reason are
+            -- the server-side decision frozen at acceptance time.  No FK to
+            -- images: a stored expected id must survive future policy changes.
+            CREATE TABLE IF NOT EXISTS receipts (
+                channel_name      TEXT NOT NULL,
+                device_id         TEXT NOT NULL,
+                seq               INTEGER NOT NULL,
+                revision          INTEGER NOT NULL,
+                status            TEXT NOT NULL,
+                installed_id      TEXT NOT NULL,
+                expected_image_id TEXT NOT NULL,
+                expected_reason   TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                PRIMARY KEY (channel_name, device_id),
+                FOREIGN KEY (channel_name) REFERENCES channels (name)
             ) WITHOUT ROWID;
             """
         )

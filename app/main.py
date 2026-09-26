@@ -28,6 +28,15 @@ GET    /channels/{name}/resolve?device_id=...
                                        trust is re-verified live and an
                                        untrusted candidate falls back to the
                                        trusted stable image
+POST   /channels/{name}/receipts       report a device's install receipt for
+                                       the channel's current revision; the
+                                       server-resolved expected image is
+                                       frozen alongside it (one per device,
+                                       highest seq wins, same-seq idempotent)
+GET    /channels/{name}/installation-audit
+                                       count current-revision matched /
+                                       drifted / failed devices from stored
+                                       receipts
 GET    /health                         liveness probe
 """
 
@@ -40,13 +49,14 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .db import (
     MAX_CHUNK,
@@ -154,6 +164,33 @@ class ChannelRequest(BaseModel):
         ge=0,
         description="0 to create, else the channel's current revision",
     )
+
+
+class ReceiptRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=256)
+    revision: int = Field(
+        ..., ge=1, le=2**63 - 1,
+        description="Channel revision installed against",
+    )
+    seq: int = Field(
+        ..., ge=1, le=2**63 - 1,
+        description="Monotonic per-(channel, device) seq (SQLite INTEGER)",
+    )
+    status: Literal["success", "failed"]
+    installed_id: Optional[str] = Field(
+        None, max_length=64, description="Installed image id; only on success"
+    )
+
+    @model_validator(mode="after")
+    def _check_installed_id(self) -> "ReceiptRequest":
+        if self.status == "success":
+            if not self.installed_id:
+                raise ValueError("installed_id is required when status is success")
+        else:
+            if self.installed_id:
+                raise ValueError("installed_id must be empty when status is failed")
+            self.installed_id = ""
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -1164,6 +1201,46 @@ def _resolve_bucket(name: str, device_id: str) -> int:
     return int.from_bytes(digest[:8], "big") % CHANNEL_BUCKET_COUNT
 
 
+def _device_decision(
+    conn: sqlite3.Connection, channel: sqlite3.Row, device_id: str
+) -> tuple[str, str, int]:
+    """Apply the channel's existing per-device resolution rules.
+
+    Loads both bound images, re-verifies their trust against the *current*
+    public keys, then buckets the device: a bucket below ``percent * 100``
+    selects the candidate (falling back to stable when the candidate is
+    untrusted), anything else the stable image.  An untrusted stable image
+    fails the whole decision with 409 — it is never served.  Returns
+    ``(image_id, reason, bucket)``.  Pure read logic shared by
+    ``GET .../resolve`` (live answer) and ``POST .../receipts`` (the answer
+    frozen into the receipt inside the writing transaction).
+    """
+    images = {
+        role: _channel_image(conn, role, image_id)
+        for role, image_id in (
+            ("stable", channel["stable_id"]),
+            ("candidate", channel["candidate_id"]),
+        )
+    }
+    keys = trusted_keys()
+    trusted = {
+        role: _image_currently_trusted(conn, row, keys)
+        for role, row in images.items()
+    }
+    if not trusted["stable"]:
+        raise HTTPException(
+            status_code=409,
+            detail="stable image is not currently trusted; channel cannot resolve",
+        )
+
+    bucket = _resolve_bucket(channel["name"], device_id)
+    if bucket < channel["percent"] * 100:  # 100 buckets per percentage point
+        if trusted["candidate"]:
+            return channel["candidate_id"], "candidate", bucket
+        return channel["stable_id"], "candidate_untrusted_fallback", bucket
+    return channel["stable_id"], "stable", bucket
+
+
 @app.put("/channels/{name}")
 def put_channel(
     req: ChannelRequest,
@@ -1273,36 +1350,10 @@ def resolve_channel(
         channel = _channel_row(conn, name)
         if channel is None:
             raise HTTPException(status_code=404, detail="channel not found")
-        images = {
-            role: _channel_image(conn, role, image_id)
-            for role, image_id in (
-                ("stable", channel["stable_id"]),
-                ("candidate", channel["candidate_id"]),
-            )
-        }
-        keys = trusted_keys()
-        trusted = {
-            role: _image_currently_trusted(conn, row, keys)
-            for role, row in images.items()
-        }
+        image_id, reason, bucket = _device_decision(conn, channel, device_id)
     finally:
         conn.close()
 
-    if not trusted["stable"]:
-        raise HTTPException(
-            status_code=409,
-            detail="stable image is not currently trusted; channel cannot resolve",
-        )
-
-    bucket = _resolve_bucket(name, device_id)
-    if bucket < channel["percent"] * 100:  # 100 buckets per percentage point
-        if trusted["candidate"]:
-            image_id, reason = channel["candidate_id"], "candidate"
-        else:
-            image_id = channel["stable_id"]
-            reason = "candidate_untrusted_fallback"
-    else:
-        image_id, reason = channel["stable_id"], "stable"
     return {
         "name": name,
         "device_id": device_id,
@@ -1311,4 +1362,207 @@ def resolve_channel(
         "reason": reason,
         "bucket": bucket,
         "percent": channel["percent"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Installation receipts
+# --------------------------------------------------------------------------- #
+
+
+def _receipt_row(
+    conn: sqlite3.Connection, name: str, device_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT channel_name, device_id, seq, revision, status, installed_id, "
+        "expected_image_id, expected_reason, created_at "
+        "FROM receipts WHERE channel_name = ? AND device_id = ?",
+        (name, device_id),
+    ).fetchone()
+
+
+@app.post("/channels/{name}/receipts")
+def post_receipt(
+    req: ReceiptRequest,
+    name: str = Path(..., min_length=1, max_length=256),
+) -> dict:
+    """Record one device's installation receipt for a channel revision.
+
+    The reported ``revision`` must equal the channel's current revision —
+    stale reports against a superseded revision are rejected with 409.
+    Inside the same ``BEGIN IMMEDIATE`` write transaction the server then
+    resolves what this device *should* have installed via exactly the same
+    rules as ``GET .../resolve`` (deterministic bucket, live trust,
+    candidate-untrusted fallback) and freezes that answer into the stored
+    row; a stable image that has lost trust rejects the receipt with 409,
+    so no receipt is ever accepted against an unservable channel.
+
+    Each (channel, device) keeps exactly one row: the receipt with the
+    greatest ``seq``.  ``seq`` grows monotonically across revisions —
+    reports for a smaller seq than the stored one get 409, a same-seq
+    report whose content differs gets 409, and a byte-identical same-seq
+    report is an idempotent no-op (its frozen expected image is returned
+    verbatim, never re-resolved).
+
+    Because channel updates and receipt reports both take the same
+    per-channel lock and the same SQLite write lock, they arbitrate
+    strictly by transaction commit order: once an update commits a new
+    revision, delayed reports carrying the old revision can no longer
+    overwrite current data (409), and a receipt that commits first is read
+    back with its own revision by any later update.
+    """
+    with task_lock(f"channel:{name}"):
+        conn = connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                channel = _channel_row(conn, name)
+                if channel is None:
+                    raise HTTPException(
+                        status_code=404, detail="channel not found"
+                    )
+                if req.revision != channel["revision"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"receipt revision {req.revision} does not match "
+                            f"current channel revision {channel['revision']}"
+                        ),
+                    )
+
+                existing = _receipt_row(conn, name, req.device_id)
+                if existing is not None and req.seq < existing["seq"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"seq {req.seq} is older than stored seq "
+                            f"{existing['seq']} for this channel/device"
+                        ),
+                    )
+
+                # Same seq: exactly identical content replays are idempotent.
+                # A stored snapshot is authoritative — it is returned as saved
+                # and never re-resolved, so later policy/key changes cannot
+                # rewrite it, and trust loss cannot turn an idempotent replay
+                # into a rejection.  Any differing field is a 409.
+                if existing is not None and req.seq == existing["seq"]:
+                    same = (
+                        req.revision == existing["revision"]
+                        and req.status == existing["status"]
+                        and (req.installed_id or "") == existing["installed_id"]
+                    )
+                    if not same:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"seq {req.seq} already recorded with "
+                                "different content"
+                            ),
+                        )
+                    result = "unchanged"
+                    expected_image_id = existing["expected_image_id"]
+                    expected_reason = existing["expected_reason"]
+                    bucket = _resolve_bucket(name, req.device_id)
+                    created_at = existing["created_at"]
+                else:
+                    # New highest seq: resolve and freeze inside this txn.
+                    expected_image_id, expected_reason, bucket = _device_decision(
+                        conn, channel, req.device_id
+                    )
+                    created_at = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        "INSERT INTO receipts "
+                        "(channel_name, device_id, seq, revision, status, "
+                        " installed_id, expected_image_id, expected_reason, "
+                        " created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT (channel_name, device_id) DO UPDATE SET "
+                        "seq = excluded.seq, "
+                        "revision = excluded.revision, "
+                        "status = excluded.status, "
+                        "installed_id = excluded.installed_id, "
+                        "expected_image_id = excluded.expected_image_id, "
+                        "expected_reason = excluded.expected_reason, "
+                        "created_at = excluded.created_at",
+                        (
+                            name,
+                            req.device_id,
+                            req.seq,
+                            req.revision,
+                            req.status,
+                            req.installed_id or "",
+                            expected_image_id,
+                            expected_reason,
+                            created_at,
+                        ),
+                    )
+                    result = "recorded"
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    return {
+        "name": name,
+        "device_id": req.device_id,
+        "seq": req.seq,
+        "revision": req.revision,
+        "status": req.status,
+        "installed_id": req.installed_id or "",
+        "expected_image_id": expected_image_id,
+        "expected_reason": expected_reason,
+        "bucket": bucket,
+        "result": result,
+        "created_at": created_at,
+    }
+
+
+@app.get("/channels/{name}/installation-audit")
+def installation_audit(
+    name: str = Path(..., min_length=1, max_length=256),
+) -> dict:
+    """Audit installation outcomes against the channel's current revision.
+
+    Only stored receipts whose ``revision`` equals the channel's current
+    revision are counted — older revisions' receipts stay persisted but
+    drop out of the audit once the channel moves on.  Every counted device
+    falls into exactly one bucket: a success whose ``installed_id`` equals
+    the expected image frozen with the receipt is a *match*, a success
+    with any other id is a *drift*, and a failed receipt is a *failure*.
+    Matching is done against the stored expected id, not a live
+    re-resolution, so subsequent strategy or public-key changes never
+    rewrite already-saved outcomes.  Read-only; a missing channel is 404.
+    """
+    conn = connect()
+    try:
+        channel = _channel_row(conn, name)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="channel not found")
+        rows = conn.execute(
+            "SELECT status, installed_id, expected_image_id "
+            "FROM receipts WHERE channel_name = ? AND revision = ?",
+            (name, channel["revision"]),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    success_match = 0
+    success_drift = 0
+    failed = 0
+    for row in rows:
+        if row["status"] == "failed":
+            failed += 1
+        elif row["installed_id"] == row["expected_image_id"]:
+            success_match += 1
+        else:
+            success_drift += 1
+    return {
+        "name": name,
+        "revision": channel["revision"],
+        "success_match": success_match,
+        "success_drift": success_drift,
+        "failed": failed,
+        "reported_devices": success_match + success_drift + failed,
     }

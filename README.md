@@ -63,6 +63,8 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET    | `/images/{id}/trust`              | 按当前公钥重新验签，返回可信判定 |
 | PUT    | `/channels/{name}`                | 创建/更新灰度发布通道（`expected_revision` 乐观并发校验） |
 | GET    | `/channels/{name}/resolve?device_id=...` | 按设备确定性解析灰度通道，实时重验可信并回退 |
+| POST   | `/channels/{name}/receipts`       | 上报设备安装回执（仅收当前修订号，服务端冻结应装镜像） |
+| GET    | `/channels/{name}/installation-audit` | 安装核对：当前修订号的成功匹配/偏离/失败设备数 |
 | GET    | `/health`                         | 存活探针 |
 
 ### 限制
@@ -89,7 +91,7 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 200    | 分片上传/查询/封存/下载/签名提交/可信查询成功 |
 | 400    | 分片为空或区间越界；签名接口的 `key_id` 未知、Base64 编码错误或签名无效（均不落库） |
 | 404    | 任务不存在（增量接口中基础镜像或目标镜像任一不存在均返回 404）；通道不存在；`PUT /channels` 中稳定或候选镜像不存在 |
-| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信 |
+| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信；回执的 `revision` 非当前修订号、`seq` 较小或同序号内容不同，或受理回执时稳定镜像失信 |
 | 413    | 分片超过 1 MiB |
 | 422    | 请求参数校验失败（JSON 字段、offset 为负等）；`proof` 的 `indices` 非法（为空、超过 64 个、重复、负数、非整数或超出叶范围）；`cleanup` 的 `idle_seconds` 非正整数或 `limit` 不在 1～100 |
 
@@ -611,6 +613,91 @@ def bucket(name: str, device_id: str) -> int:
 assert bucket("release-1", "dev-0042") == 8202  # 与响应中的 bucket 一致
 ```
 
+### 上报安装回执
+
+```
+POST /channels/{name}/receipts
+{"device_id":"dev-0042","revision":1,"seq":3,"status":"success",
+ "installed_id":"<实际安装的镜像 ID>"}
+```
+
+字段与规则：
+
+- `device_id`：非空（1～256 字符）；`revision` 为设备本次安装所依据的**通道修订号**，
+  必须**等于通道当前修订号**，旧修订号的延迟上报一律 **409**（不会覆盖新数据）。
+- `seq`：**正整数**，在同一（通道, 设备）上**跨修订号单调递增**。每个通道设备只
+  保留序号最大的一条回执：较小序号返回 **409**；**同序号必须内容完全相同**（幂等，
+  返回 200 且 `result="unchanged"`），同序号内容不同返回 **409**。
+- `status`：`success` 或 `failed`。**成功必须带非空 `installed_id`；失败必须不带
+  （或为空）`installed_id`**，否则 422。
+- 受理时，服务端在**同一个 SQLite 写事务内**按与 `resolve` 完全相同的现有决议规则
+  （桶号 + 当前公钥实时验签 + 候选失信回退）计算该设备**应装镜像**
+  （`expected_image_id` / `expected_reason`），并随回执一起冻结保存；此时**稳定
+  镜像若已失信则拒收（409）**。后续策略或公钥变化不会改写已保存的应装结果；同序号
+  幂等重放直接返回旧快照、不再重新决议（因此即使之后稳定镜像失信，重放仍 200）。
+
+```bash
+# 先解析出本设备应装镜像
+RESOLVED=$(curl -s "localhost:8000/channels/release-1/resolve?device_id=dev-0042")
+echo "$RESOLVED"
+# -> {"name":"release-1","device_id":"dev-0042","image_id":"abc…",
+#     "revision":1,"reason":"candidate","bucket":…,"percent":25}
+
+REV=$(echo "$RESOLVED" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')
+SHOULD=$(echo "$RESOLVED" | python3 -c 'import sys,json;print(json.load(sys.stdin)["image_id"])')
+
+# 上报成功安装（installed_id 为实际刷入的镜像；失败时去掉 installed_id 并改 status）
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"dev-0042\",\"revision\":$REV,\"seq\":3,
+       \"status\":\"success\",\"installed_id\":\"$SHOULD\"}"
+# -> {"name":"release-1","device_id":"dev-0042","seq":3,"revision":1,
+#     "status":"success","installed_id":"abc…",
+#     "expected_image_id":"abc…","expected_reason":"candidate",
+#     "bucket":…,"result":"recorded","created_at":"2026-09-26T…"}
+
+# 安装失败：不得携带 installed_id
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev-0043","revision":1,"seq":1,"status":"failed"}'
+
+# 同序号原样重放 -> 幂等（result=unchanged，应装快照原样返回）
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"dev-0042\",\"revision\":$REV,\"seq\":3,
+       \"status\":\"success\",\"installed_id\":\"$SHOULD\"}"
+
+# 通道更新到修订号 2 之后，旧修订号的延迟上报返回 409
+curl -s -X POST "localhost:8000/channels/release-1/receipts" \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"dev-0042","revision":1,"seq":99,"status":"failed"}'
+# -> {"detail":"receipt revision 1 does not match current channel revision 2"}
+```
+
+### 安装核对
+
+```
+GET /channels/{name}/installation-audit
+```
+
+只统计**当前修订号**的回执（旧修订号回执仍保留在库中，但不再计入），每台设备
+恰好归入一类：
+
+- `success_match`：成功且 `installed_id` 等于受理时冻结保存的**应装镜像**；
+- `success_drift`：成功但装的是别的镜像；
+- `failed`：上报失败。
+
+```bash
+curl -s "localhost:8000/channels/release-1/installation-audit"
+# -> {"name":"release-1","revision":2,
+#     "success_match":1280,"success_drift":7,"failed":13,
+#     "reported_devices":1300}
+```
+
+核对基于**已保存的应装快照**进行，不做实时重决议：此后调整灰度比例、更换稳定/候选
+镜像或轮换公钥，都不会改变历史回执的归类。通道不存在返回 404。回执与通道策略一样
+持久化在 SQLite 中，随 Compose 命名卷跨重建保留。
+
 ## 一致性与并发设计
 
 - **原子校验-写入**：每次分片上传在一个 `BEGIN IMMEDIATE` 事务中完成
@@ -644,9 +731,19 @@ assert bucket("release-1", "dev-0042") == 8202  # 与响应中的 bucket 一致
   以固定大小分片顺序扫描已封存字节并在线建树；内存占用只随叶数（每叶一个
   32 字节哈希）与本次请求返回的块数（至多 64 块）增长，**不随镜像总长增长**。
   树不落库、无状态，每次请求从已封存字节重算，因此历史封存镜像无需迁移。
-- **持久化**：全部状态（任务、分片字节、封存标志、签名、灰度通道策略与修订号）
-  都在 SQLite 中；配合 Compose 命名卷，容器/镜像重建后任务、分片、签名与通道
-  继续可用。通道的可信判定不缓存：解析时按当前公钥实时重验。
+- **回执与通道更新按提交顺序裁决**：`POST /channels/{name}/receipts` 在单个
+  `BEGIN IMMEDIATE` 写事务内完成“核对当前修订号 → 序号裁决 → 按现有决议规则计算应装
+  镜像（稳定镜像失信则 409 拒收）→ 随回执冻结落库”。通道更新与回执上报共用同一把
+  通道锁与同一把 SQLite 写锁，因此两者严格按事务提交顺序串行：更新先提交后，携带旧
+  修订号的延迟上报只能得到 409，绝不覆盖新数据；回执先提交则被之后的更新原样读到。
+  每个（通道, 设备）仅保留序号最大的一条回执（序号跨修订号递增，较小序号 409、同
+  序号内容不同 409、同序号同内容幂等）；`installation-audit` 只统计当前修订号的
+  成功匹配/成功偏离/失败，且按保存时冻结的应装镜像归类，策略或公钥后续变化不改写
+  历史结果。
+- **持久化**：全部状态（任务、分片字节、封存标志、签名、灰度通道策略、修订号与安装
+  回执）都在 SQLite 中；配合 Compose 命名卷，容器/镜像重建后任务、分片、签名、通道
+  与回执继续可用。通道的可信判定不缓存：解析时按当前公钥实时重验（回执里的应装镜像
+  是受理当时的冻结快照，属于例外）。
 - 服务默认以**单个 uvicorn worker** 运行（见 Dockerfile CMD）。单 worker
   配合线程池即可并发处理请求，且与单文件 SQLite 的写模型最为匹配。
 
@@ -672,7 +769,13 @@ python -m pytest tests/ -v
 灰度通道覆盖参数校验 422、首建/更新修订号校验 409、镜像不存在 404、未封存/
 未达可信阈值 409、拒绝调用不落库、按参考实现逐设备对拍桶号与选边（含非 ASCII
 device_id）、`percent` 取 0/100 的边界行为、候选失信回退稳定镜像、稳定镜像
-失信 409，以及模拟容器重建后策略与同设备决议完全一致；闲置回收覆盖参数校验
+失信 409，以及模拟容器重建后策略与同设备决议完全一致；安装回执覆盖参数校验 422
+（成功缺 `installed_id`、失败带 `installed_id`、非法状态/序号/修订号）、未知通道
+404、应装镜像随回执冻结保存、同序号幂等与内容不同 409、较小序号 409、序号跨修订号
+递增、旧修订号延迟上报 409 且不覆盖新数据、核对只统计当前修订号（匹配/偏离/失败
+分类与翻转）、稳定镜像失信拒收但同序号重放仍幂等、策略与公钥变化不改写已保存的应装
+结果、模拟容器重建后回执与序号裁决保持一致，以及与通道更新并发交错时按提交顺序裁决
+（无 500、每设备序号单调、存活行恰为最大序号）；闲置回收覆盖参数校验
 422（`idle_seconds` 非正、`limit` 越界/非整数/缺失）、只回收未封存且到期任务、
 释放字节数按不相交区间精确统计、`limit` 截断与 `(last_activity_at, id)` 排序
 （含同时间戳按 ID 破并）、重复调用逐批清空、成功上传（含重复分片）刷新活动时间、
